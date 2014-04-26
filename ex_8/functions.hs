@@ -15,6 +15,11 @@ data LispVal = Atom String
              | Character Char
              | List [LispVal]
              | DottedList [LispVal] LispVal
+             | PrimitiveFunc ([LispVal] -> ThrowsError LispVal)
+             | Func {params :: [String]       -- names of the parameters
+                    ,vararg :: (Maybe String)  -- whehter function accepts varaible-length list of arguments
+                    ,body :: [LispVal]        -- function body as list of expressions
+                    ,closure :: Env }         -- the environment the function was created in
 
 instance Show LispVal where show = showVal
 
@@ -27,8 +32,16 @@ showVal (Number number) = show number -- ++ "[Number]"
 showVal (Character char) = show char -- ++ "[Character]"
 showVal (List contents) = "(" ++ unwordsList contents ++ ")"
 showVal (DottedList head tail) = "(" ++ unwordsList head ++ " . " ++ showVal tail ++ ")"
+showVal (PrimitiveFunc _) = "<primitive>"
+showVal (Func {params = args, vararg = varargs, body = body, closure = env}) =
+    "(lambda (" ++ unwords (map show args) ++
+        (case varargs of
+            Nothing -> ""
+            Just arg -> " . " ++ arg) ++ ") ...)"
+
 unwordsList :: [LispVal] -> String
 unwordsList = unwords . map showVal
+
 
 -- For Error Reporting
 data LispError  = NumArgs Integer [LispVal]
@@ -60,23 +73,23 @@ instance Error LispError where
 Definition of Error:
 
 class Error a where
-	noMsg :: a 				-- creates an exception without a message
-	strMsg :: String -> a 	-- creates an exception with a message.
+    noMsg :: a              -- creates an exception without a message
+    strMsg :: String -> a   -- creates an exception with a message.
 
 sample instances:
-	Error String	- throwing a string as an error
-	Error IOError	- IO related error
-	Error LispError	- our usage of error.
+    Error String    - throwing a string as an error
+    Error IOError   - IO related error
+    Error LispError - our usage of error.
 
 The error monad:
 
 class Monad m => MonadError e m | m -> e where
-	throwError :: e -> m a					-- used within a monadic computation to begin exception processing.
-	catchError :: m a -> (e -> m a) -> m a	-- a handler function to handle previous errors and return to normal execution.
-											-- e.g. do { action_1; action_2; action_3 } `catchError` handler
+    throwError :: e -> m a                  -- used within a monadic computation to begin exception processing.
+    catchError :: m a -> (e -> m a) -> m a  -- a handler function to handle previous errors and return to normal execution.
+                                            -- e.g. do { action_1; action_2; action_3 } `catchError` handler
 
 sample instances:
-	Error e => MonadError e (Either e)
+    Error e => MonadError e (Either e)
 --}
 
 -- Catch the LispError that has been previous generated using throwError, and convert it to string.
@@ -164,8 +177,8 @@ readExpr input = case parse parseExpr "lisp" input of
 data IORef a
 a mutable variable in the IO monad
 
-newIORef :: a -> IO (IORef a)	-- build a new IORef
-readIORef :: IORef a -> IO a	-- read the value of IORef
+newIORef :: a -> IO (IORef a)   -- build a new IORef
+readIORef :: IORef a -> IO a    -- read the value of IORef
 writeIORef :: IORef a -> a -> IO () -- write a new value into IORef
 emodifyIORef :: IORef a -> (a -> a) -> IO () -- mutable the contents of an IORef
 --}
@@ -181,8 +194,8 @@ nullEnv = newIORef []
 -- where: e - error type, m - inner monnad
 -- Constructor: runErrorT :: m (Either e a)
 -- partial type, the the following usage, it would be :
---	IOThrowsError String
---	IOThrowsError LispVal
+--  IOThrowsError String
+--  IOThrowsError LispVal
 type IOThrowsError = ErrorT LispError IO
 
 -- Converts a ThrowsError to IOThrowsError
@@ -204,8 +217,8 @@ isBound envRef var = readIORef envRef >>= return . maybe False (const True) . lo
 -- maybe n _ Nothing = n
 -- maybe _ f (Just x) = f x
 -- maybe default_value function maybe_value =
---		if maybe_value is Nothing, then return default_value
---		else return function(maybe_value)
+--      if maybe_value is Nothing, then return default_value
+--      else return function(maybe_value)
 
 getVar :: Env -> String -> IOThrowsError LispVal
 getVar envRef var = do
@@ -237,7 +250,7 @@ defineVar envRef var value = do
             env <- readIORef envRef  -- returns ()?
             writeIORef envRef ((var, valueRef) : env)
             return value
--- readIORef :: IORef a -> IO a	-- read the value of IORef
+-- readIORef :: IORef a -> IO a -- read the value of IORef
 -- writeIORef :: IORef a -> a -> IO () -- write a new value into IORef
 
 -- Creates and Env from the lisp of (String, LispVal).
@@ -260,14 +273,46 @@ eval env (List [Atom "if", pred, conseq, alt]) = do
         otherwise  -> eval env conseq
 eval env (List [Atom "set!", Atom var, form]) = eval env form >>= setVar env var
 eval env (List [Atom "define", Atom var, form]) = eval env form >>= defineVar env var
-eval env (List (Atom func : args)) = mapM (eval env) args >>= liftThrows . apply func
+eval env (List (Atom "define" : List (Atom var : params) : body)) = 
+    makeNormalFunc env params body >>= defineVar env var
+eval env (List (Atom "define" : DottedList (Atom var : params) varargs : body)) =
+    makeVarargs varargs env params body >>= defineVar env var
+eval env (List (Atom "lambda" : List params : body)) =
+    makeNormalFunc env params body
+eval env (List (Atom "lambda" : DottedList params varargs : body)) =
+    makeVarargs varargs env params body
+eval env (List (Atom "lambda" : varargs@(Atom _) : body)) =
+    makeVarargs varargs env [] body
+eval env (List (function : args)) = do
+    func <- eval env function
+    argVals <- mapM (eval env) args
+    apply func argVals
 eval env badForm = throwError $ BadSpecialForm "Unrecognised special form" badForm
 
 
-apply :: String -> [LispVal] -> ThrowsError LispVal
-apply func args = maybe (throwError $ NotFunction "Unrecognised primitive function args" func)
-                        ($ args)
-                        (lookup func primitives)
+apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
+apply (PrimitiveFunc func) args = liftThrows $ func args
+apply (Func params varargs body closure) args =
+    if num params /= num args && varargs == Nothing
+        then throwError $ NumArgs (num params) args
+        else (liftIO $ bindVars closure $ zip params args) >>= bindVarArgs varargs >>= evalBody
+    where
+        remainingArgs = drop (length params) args
+        num = toInteger . length
+        evalBody env = liftM last $ mapM (eval env) body
+        bindVarArgs arg env = case arg of
+            Just argName -> liftIO $ bindVars env [(argName, List $ remainingArgs)]
+            Nothing -> return env
+
+
+makeFunc varargs env params body = return $ Func (map showVal params) varargs body env
+makeNormalFunc = makeFunc Nothing
+makeVarargs = makeFunc . Just . showVal
+
+primitiveBindings :: IO Env
+primitiveBindings = nullEnv >>= (flip bindVars $ map makePrimitiveFunc primitives)
+    where
+        makePrimitiveFunc (var, func) = (var, PrimitiveFunc func)
 
 primitives :: [(String, [LispVal] -> ThrowsError LispVal)]
 primitives = [  ("+",               numericBinop (+)),
@@ -422,10 +467,10 @@ until_ pred prompt action = do
         else action result >> until_ pred prompt action
 
 runOne :: String -> IO ()
-runOne expr = nullEnv >>= flip evalAndPrint expr
+runOne expr = primitiveBindings >>= flip evalAndPrint expr
         
 runRepl :: IO ()
-runRepl = nullEnv >>= ( until_ (== "quit") (readPrompt "Lisp>>> ") ) . evalAndPrint
+runRepl = primitiveBindings >>= ( until_ (== "quit") (readPrompt "Lisp>>> ") ) . evalAndPrint
 -- here, the action has become the curried function (evalAndPrint env), and all the subsequent
 -- evaluation within until_, the futher modified env will be passed along.
 

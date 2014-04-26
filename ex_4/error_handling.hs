@@ -5,7 +5,9 @@ import System.Environment
 import Text.ParserCombinators.Parsec hiding (spaces)
 
 -- For Parser Tree
-
+{--
+Use data keyword to declare new data type.
+--}
 data LispVal = Atom String
              | Bool Bool
              | String String
@@ -37,6 +39,8 @@ data LispError  = NumArgs Integer [LispVal]
                 | UnboundVar String String
                 | Default String
 
+instance Show LispError where show = showError
+
 showError :: LispError -> String
 showError (NumArgs expected found) = "Expected " ++ show expected ++ " args; found values " ++ unwordsList found
 showError (TypeMismatch expected found) = "Invalid type: expected " ++ expected ++ ", found " ++ show found
@@ -46,16 +50,65 @@ showError (NotFunction message func) = message ++ ": " ++ show func
 showError (UnboundVar message varname) = message ++ ": " ++ varname
 showError (Default message) = message
 
-instance Show LispError where show = showError
+
+{--
+Definition of Error:
+
+class Error a where
+	noMsg :: a 				-- creates an exception without a message
+	strMsg :: String -> a 	-- creates an exception with a message.
+
+sample instances:
+	Error String	- throwing a string as an error
+	Error IOError	- IO related error
+	Error LispError	- our usage of error.
+
+The error monad:
+
+class Monad m => MonadError e m | m -> e where
+	throwError :: e -> m a					-- used within a monadic computation to begin exception processing.
+	catchError :: m a -> (e -> m a) -> m a	-- a handler function to handle previous errors and return to normal execution.
+											-- e.g. do { action_1; action_2; action_3 } `catchError` handler
+
+sample instances:
+	Error e => MonadError e (Either e)
+--}
 
 instance Error LispError where 
     noMsg = Default "An error has occurred"
     strMsg = Default
 
-type ThrowsError = Either LispError
+{--
+data Either a b = Left a | Right b
 
-trapError action = catchError action (return . show)
+Represents values with two possiblities, a value of type Either a b is either Left a or Right b.
+When used to represent either correct or error, Left is used to hold an error, while the
+Right constructor is used to hold the correct value.
 
+either :: (a -> c) -> (b -> c) -> Either a b -> c
+lefts :: [Either a b] -> [a]
+rights :: [Either a b] -> [b]
+partitionEithers :: [Either a b] -> ([a], [b])
+
+When used in Monad:
+instance Monad (Either e) where
+	return = Right
+	Right m >>= f = f m		-- Apply function if value is right
+	Left e  >>= _ = Left e	-- Directly return the (incorrect value) of left.
+
+The followinng ThrowsError is a partial type, and in the usage followed, it is
+used as ThrowsError LispVal, which is equivalent to Either LispError LispVal.
+
+The type keyword is used to create type synonymes, e.g. type String = [Char]
+--}
+type ThrowsError = Either LispError -- or CorrectValue
+
+-- Attempt to execute the given action, if error occurs, catch the LispError that has been
+-- previous generated using throwError, and convert it to string.
+trapError :: (Show e, MonadError e m) => m String -> m String
+trapError action = do { action; } `catchError` (return . show)
+
+-- Extract value of execution for the case that no error has been generated.
 extractValue :: ThrowsError a -> a
 extractValue (Right val) = val
 
@@ -96,7 +149,10 @@ parseString = do
     return $ String x
 
 parseNumber :: Parser LispVal
-parseNumber = liftM (Number . read) $ many1 digit
+parseNumber = liftM (Number . read) $ many1 digit 
+-- liftM :: (Monad m) => (a -> r) -> m a -> m r 
+-- liftM f m = do {x <- m; return (f x1)}
+-- liftM f m = m >>= \x -> return f x
 
 parseList :: Parser LispVal
 parseList = liftM List $ sepBy parseExpr spaces
